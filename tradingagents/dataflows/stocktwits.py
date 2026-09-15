@@ -18,10 +18,13 @@ import contextlib
 import http.client
 import json
 import logging
+import time
 from datetime import datetime
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .date_window import in_window
+from .reddit import jitter, retry_after_seconds, retry_fallback_seconds
 from .symbol_utils import crypto_base
 
 logger = logging.getLogger(__name__)
@@ -70,6 +73,7 @@ def fetch_stocktwits_messages(
     timeout: float = 10.0,
     start_date: str | None = None,
     end_date: str | None = None,
+    _retry: bool = True,
 ) -> str:
     """Fetch recent StockTwits messages for ``ticker`` and return them as a
     formatted plaintext block ready for prompt injection.
@@ -88,6 +92,37 @@ def fetch_stocktwits_messages(
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
+    except HTTPError as exc:
+        # HTTP statuses are not interchangeable, and HTTPError is an OSError, so
+        # the generic clause below would otherwise launder all of them into one
+        # "unavailable" string the caller cannot act on.
+        if exc.code == 404:
+            # StockTwits answers 404 with {"errors":[{"message":"Symbol not
+            # found"}]} -- a fact about the symbol, not an outage. Report it as
+            # an empty stream so the analyst doesn't hedge over a failure that
+            # never happened.
+            logger.info("StockTwits does not list %s (404)", ticker)
+            return f"<no StockTwits messages found for ${ticker.upper()}>"
+        if exc.code in (403, 429) and _retry:
+            # 429 is the per-IP throttle. 403 is Cloudflare, which fronts this
+            # endpoint and answers a fraction of keyless requests with a "Just a
+            # moment..." HTML challenge -- seen on the same URL between two
+            # successful responses, so it is transient and says nothing about
+            # the symbol. Both are retryable; back off once, as reddit.py does,
+            # and against the same measured floor: a shorter wait spends the one
+            # retry on a request that cannot succeed yet.
+            retry_after = retry_after_seconds(exc)
+            wait = retry_after if retry_after is not None else jitter(retry_fallback_seconds)
+            logger.warning(
+                "StockTwits HTTP %s for %s -- backing off %.1fs then retrying once",
+                exc.code, ticker, wait,
+            )
+            time.sleep(wait)
+            return fetch_stocktwits_messages(
+                ticker, limit, timeout, start_date, end_date, _retry=False
+            )
+        logger.warning("StockTwits fetch failed for %s: HTTP %s", ticker, exc.code)
+        return f"<stocktwits unavailable: HTTP {exc.code}>"
     except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
         # OSError covers URLError/TimeoutError/connection resets; HTTPException
         # covers chunked-transfer errors (IncompleteRead/BadStatusLine, #1024).
