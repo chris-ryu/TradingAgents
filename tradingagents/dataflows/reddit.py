@@ -137,6 +137,14 @@ def _retry_after_seconds(exc: HTTPError) -> float | None:
         return None
 
 
+# Re-exported for the StockTwits fetcher, which is throttled by the same kind of
+# per-IP limit and parses the same header. Public names so a sibling module does
+# not have to reach for private ones; the implementations stay upstream's.
+retry_after_seconds = _retry_after_seconds
+retry_fallback_seconds = _RETRY_FALLBACK_SECONDS
+jitter = _jitter
+
+
 # Reddit search feeds are small (a page of results); cap the read so a
 # compromised or misbehaving endpoint can't stream an unbounded body into
 # memory before we parse it. Overflow raises http.client.HTTPException, which
