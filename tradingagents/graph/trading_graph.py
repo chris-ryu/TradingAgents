@@ -76,6 +76,20 @@ def _coerce_max_tokens(value):
     return n
 
 
+def deep_llm_kwargs(config: dict[str, Any], base_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Kwargs for the deep-think client: the shared kwargs, with ``deep_temperature``
+    replacing ``temperature`` when it is set.
+
+    None or "" means inherit, so existing configs keep sampling both models at
+    ``temperature``. ``float()`` accepts the string an env var delivers.
+    """
+    kwargs = dict(base_kwargs)
+    deep_temperature = config.get("deep_temperature")
+    if deep_temperature is not None and deep_temperature != "":
+        kwargs["temperature"] = float(deep_temperature)
+    return kwargs
+
+
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
@@ -116,7 +130,7 @@ class TradingAgentsGraph:
             provider=self.config["llm_provider"],
             model=self.config["deep_think_llm"],
             base_url=self.config.get("backend_url"),
-            **llm_kwargs,
+            **deep_llm_kwargs(self.config, llm_kwargs),
         )
         quick_client = create_llm_client(
             provider=self.config["llm_provider"],

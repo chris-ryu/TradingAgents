@@ -81,3 +81,85 @@ class TestProviderKwargsTemperature:
 
     def test_empty_string_omitted(self):
         assert "temperature" not in self._kwargs_for("")
+
+
+@pytest.mark.unit
+class TestDeepTemperatureKwargs:
+    """deep_temperature overrides temperature for the deep-think client only."""
+
+    def test_deep_temperature_overrides_temperature(self):
+        from tradingagents.graph.trading_graph import deep_llm_kwargs
+        base = {"temperature": 0.3, "max_retries": 5, "callbacks": ["cb"]}
+        deep = deep_llm_kwargs({"deep_temperature": 0.7}, base)
+        assert deep == {"temperature": 0.7, "max_retries": 5, "callbacks": ["cb"]}
+        assert base["temperature"] == 0.3  # the shared kwargs are not mutated
+
+    def test_none_and_empty_inherit_temperature(self):
+        from tradingagents.graph.trading_graph import deep_llm_kwargs
+        base = {"temperature": 0.3}
+        assert deep_llm_kwargs({"deep_temperature": None}, base) == {"temperature": 0.3}
+        assert deep_llm_kwargs({"deep_temperature": ""}, base) == {"temperature": 0.3}
+        assert deep_llm_kwargs({}, base) == {"temperature": 0.3}
+
+    def test_env_string_is_coerced_to_float(self):
+        from tradingagents.graph.trading_graph import deep_llm_kwargs
+        assert deep_llm_kwargs({"deep_temperature": "0.7"}, {})["temperature"] == 0.7
+
+    def test_deep_temperature_alone_sets_only_the_deep_side(self):
+        # No shared temperature: the deep client gets one, the quick side keeps the provider default.
+        from tradingagents.graph.trading_graph import deep_llm_kwargs
+        assert deep_llm_kwargs({"deep_temperature": 0.7}, {}) == {"temperature": 0.7}
+
+
+@pytest.mark.unit
+class TestDeepTemperatureEnvOverlay:
+    def test_env_sets_deep_temperature(self, monkeypatch):
+        import tradingagents.default_config as dc
+        monkeypatch.setenv("TRADINGAGENTS_DEEP_TEMPERATURE", "0.7")
+        importlib.reload(dc)
+        assert float(dc.DEFAULT_CONFIG["deep_temperature"]) == 0.7
+        monkeypatch.delenv("TRADINGAGENTS_DEEP_TEMPERATURE", raising=False)
+        importlib.reload(dc)
+
+    def test_default_deep_temperature_is_none(self, monkeypatch):
+        import tradingagents.default_config as dc
+        monkeypatch.delenv("TRADINGAGENTS_DEEP_TEMPERATURE", raising=False)
+        importlib.reload(dc)
+        assert dc.DEFAULT_CONFIG["deep_temperature"] is None
+
+
+@pytest.mark.unit
+def test_graph_builds_deep_and_quick_clients_at_their_own_temperatures(monkeypatch, tmp_path):
+    """The constructor must hand deep_temperature to the deep client and temperature to the quick one."""
+    from unittest.mock import MagicMock
+
+    import tradingagents.graph.trading_graph as tg
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def get_llm(self):
+            return MagicMock(name="llm")
+
+    monkeypatch.setattr(tg, "create_llm_client", lambda **kw: FakeClient(**kw))
+    # Keep the constructor off the network and away from graph compilation.
+    monkeypatch.setattr(tg.TradingAgentsGraph, "_create_tool_nodes", lambda self: {})
+    monkeypatch.setattr(tg, "GraphSetup", lambda *a, **k: MagicMock(name="setup"))
+    monkeypatch.setattr(tg, "TradingMemoryLog", lambda cfg: MagicMock(name="memory"))
+
+    config = dict(
+        tg.DEFAULT_CONFIG,
+        llm_provider="openai_compatible", backend_url="http://llm.test/v1",
+        deep_think_llm="deep-x", quick_think_llm="quick-x",
+        temperature=0.3, deep_temperature=0.7, checkpoint_enabled=False,
+        results_dir=str(tmp_path / "results"), data_cache_dir=str(tmp_path / "cache"),
+        memory_log_path=str(tmp_path / "memory.md"),
+    )
+    tg.TradingAgentsGraph(debug=False, config=config)
+
+    by_model = {c["model"]: c for c in calls}
+    assert by_model["deep-x"]["temperature"] == 0.7
+    assert by_model["quick-x"]["temperature"] == 0.3
