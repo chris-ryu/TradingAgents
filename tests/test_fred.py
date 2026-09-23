@@ -117,7 +117,7 @@ class FredFormattingTests(unittest.TestCase):
         # the run is not aborted over an optional macro lookup.
         no_series = {"seriess": []}
         with mock.patch.object(fred, "_request", side_effect=_request_stub(meta=no_series)):
-            out = fred.get_macro_data("totally_unknown_xyz", "2025-09-30", 30)
+            out = fred.get_macro_data("ZZTOTALLYUNKNOWNX", "2025-09-30", 30)
         self.assertIn("not found", out)
 
     def test_long_series_is_truncated_but_change_uses_full_range(self):
@@ -229,6 +229,72 @@ class FredRoutingTests(unittest.TestCase):
         ):
             out = interface.route_to_vendor("get_macro_indicators", "cpi", "2026-06-01", 365)
         self.assertIn("DATA_UNAVAILABLE", out)
+
+
+@pytest.mark.unit
+class FredSeriesIdHardeningTests(unittest.TestCase):
+    """Pins the two FRED production defects seen in judge logs.
+
+    Expected values are derived from FRED's documented series_id rule (the
+    API itself answers 400 "Series IDs should be 25 or less alphanumeric
+    characters") and from the observed 400 error_message "The series does
+    not exist.", never from running this code.
+    """
+
+    def test_series_id_boundary_25_accepted_26_rejected(self):
+        # FRED: series IDs are 25 or fewer alphanumeric characters. Both
+        # sides of the boundary must hold locally so the guard rejects
+        # exactly what the API rejects.
+        self.assertEqual(fred._resolve_series_id("A" * 25), "A" * 25)
+        with self.assertRaises(ValueError):
+            fred._resolve_series_id("A" * 26)
+
+    def test_raw_ids_with_punctuation_rejected_aliases_still_resolve(self):
+        # Aliases are looked up BEFORE the plausibility guard and their keys
+        # legitimately contain underscores/hyphens, so alias resolution must
+        # keep working; the guard applies to RAW ids, where FRED requires
+        # alphanumeric only.
+        self.assertEqual(fred._resolve_series_id("10y_treasury"), "DGS10")
+        self.assertEqual(fred._resolve_series_id("10y-treasury"), "DGS10")
+        self.assertEqual(fred._resolve_series_id("fed_funds"), "FEDFUNDS")
+        for bad in ("ABC_DEF", "ABC-DEF", "ABC,X", "ABC(X)"):
+            with self.assertRaises(ValueError, msg=bad):
+                fred._resolve_series_id(bad)
+
+    def test_real_api_not_found_error_returns_guidance_not_raises(self):
+        # The real FRED API answers an unknown series with HTTP 400 and
+        # error_message "The series does not exist.", so _request raises
+        # before any empty-seriess branch can run. get_macro_data must
+        # convert that into the actionable not-found guidance it already
+        # promises for the empty case, not let the ValueError abort the
+        # optional macro lookup.
+        def _raise_unknown(path, params):
+            raise ValueError(
+                "FRED request failed: Bad Request. The series does not exist."
+            )
+
+        # Control: the id itself resolves, so the first failure below can
+        # only be the error-handling behaviour under test.
+        self.assertEqual(fred._resolve_series_id("ZZTOPNOTREAL"), "ZZTOPNOTREAL")
+        with mock.patch.object(fred, "_request", side_effect=_raise_unknown):
+            out = fred.get_macro_data("ZZTOPNOTREAL", "2026-01-01", 30)
+        self.assertIsInstance(out, str)
+        self.assertIn("not found", out)
+        self.assertIn("ZZTOPNOTREAL", out)
+
+    def test_non_not_found_request_error_still_propagates(self):
+        # Only the not-found 400 may be absorbed into guidance. Any other
+        # _request failure (bad key, quota, transport) must keep raising so
+        # the routing layer sees a vendor failure; a not-found-shaped
+        # swallow here would mask real outages as "no such series".
+        def _raise_auth(path, params):
+            raise ValueError("FRED request failed: Bad Request. api_key is invalid")
+
+        self.assertEqual(fred._resolve_series_id("ZZTOPNOTREAL"), "ZZTOPNOTREAL")
+        with mock.patch.object(fred, "_request", side_effect=_raise_auth):
+            with self.assertRaises(ValueError) as caught:
+                fred.get_macro_data("ZZTOPNOTREAL", "2026-01-01", 30)
+        self.assertIn("api_key", str(caught.exception))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ the routing layer treats it as "unavailable" rather than a hard crash.
 """
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 
 import pytz
@@ -38,6 +39,23 @@ DEFAULT_LOOKBACK_DAYS = 365
 # Rows cap for the rendered table: recent values matter most for a decision, and
 # daily series (yields, VIX) over a long window would otherwise flood context.
 MAX_ROWS = 40
+
+# FRED's own series_id rule, mirrored locally: 25 or fewer alphanumeric
+# characters. The API answers 400 "Series IDs should be 25 or less alphanumeric
+# characters", so the guard below rejects exactly that set instead of paying a
+# round trip for it. ASCII-only on purpose: str.isalnum() also accepts non-ASCII
+# digits and letters (for example "2" or roman numerals) that FRED does not.
+SERIES_ID_PATTERN = re.compile(r"[A-Z0-9]{1,25}")
+
+# _request renders every FRED HTTP 400 as ValueError("<prefix><error_message>"),
+# which is the only signal a caller can classify on. One constant, so _request
+# and the classifier below cannot drift apart.
+REQUEST_ERROR_PREFIX = "FRED request failed: "
+
+# FRED's documented wording for an unknown series, and the only wording treated
+# as "not found". Key/auth/quota/parameter failures read "api_key is invalid",
+# "must be a date" and the like; none of them claims non-existence.
+NOT_FOUND_MESSAGE_MARKERS = ("the series does not exist",)
 
 # Curated human-friendly aliases -> FRED series IDs. Anything not listed is used
 # verbatim as a raw FRED series ID, so power users are never limited to this set.
@@ -111,9 +129,12 @@ def _resolve_series_id(indicator: str) -> str:
     if key in MACRO_SERIES:
         return MACRO_SERIES[key]
     candidate = indicator.strip().upper()
-    # FRED series IDs never contain whitespace and are short; reject anything
-    # else (a descriptive phrase the LLM passed) rather than 400ing the API.
-    if not candidate or len(candidate) > 30 or any(c.isspace() for c in candidate):
+    # FRED series IDs are 25 or fewer alphanumeric characters; reject anything
+    # else — a descriptive phrase the LLM passed, or an id carrying punctuation
+    # the API would 400 — rather than paying for the failure. The alias lookup
+    # above is what lets keys like "10y_treasury" resolve, so the underscore and
+    # hyphen belong to the alias namespace only, never to a raw id.
+    if SERIES_ID_PATTERN.fullmatch(candidate) is None:
         raise ValueError(
             f"'{indicator}' is not a known macro alias or a valid FRED series ID. "
             f"Use an alias (e.g. 'cpi', 'unemployment', '10y_treasury') or a raw "
@@ -145,9 +166,50 @@ def _request(path: str, params: dict) -> dict:
             message = response.json().get("error_message", response.text)
         except ValueError:
             message = response.text
-        raise ValueError(f"FRED request failed: {message}")
+        raise ValueError(f"{REQUEST_ERROR_PREFIX}{message}")
     response.raise_for_status()
     return response.json()
+
+
+
+def _not_found_guidance(series_id: str) -> str:
+    """Actionable message for a series FRED does not have.
+
+    Shared by both ways that happens: the HTTP 400 path and an HTTP 200 whose
+    ``seriess`` list came back empty.
+    """
+    return (
+        f"FRED series '{series_id}' not found. Pass a known alias "
+        f"(e.g. 'cpi', 'unemployment') or a valid FRED series ID."
+    )
+
+
+def _is_unknown_series_error(exc: ValueError) -> bool:
+    """True only for FRED's own "this series does not exist" 400.
+
+    _request flattens every 400 into a ValueError carrying FRED's error_message,
+    so text is the only discriminator here. Two conditions must both hold, and
+    they are deliberately narrow:
+
+      * the text starts with the prefix _request itself adds, which an error
+        raised anywhere else cannot carry — a missing API key
+        (FredNotConfiguredError, also a ValueError), a transport failure or some
+        other module's ValueError is excluded before the wording is even read;
+      * the remainder contains FRED's documented not-found wording, a statement
+        about the series identity. An invalid or missing key, a quota refusal or
+        a malformed parameter never says a series "does not exist".
+
+    So an auth or network outage cannot be mistaken for "no such series"; it
+    keeps raising, and the routing layer still reports a vendor failure rather
+    than losing macro data silently.
+    """
+    if isinstance(exc, FredNotConfiguredError):
+        return False
+    text = str(exc)
+    if not text.startswith(REQUEST_ERROR_PREFIX):
+        return False
+    detail = text[len(REQUEST_ERROR_PREFIX) :].lower()
+    return any(marker in detail for marker in NOT_FOUND_MESSAGE_MARKERS)
 
 
 def get_macro_data(
@@ -197,12 +259,20 @@ def get_macro_data(
     except ValueError as e:
         return f"FRED: {e}"
 
-    meta = _request("series", {"series_id": series_id, **realtime}).get("seriess") or []
+    # The real FRED API answers an unknown series with HTTP 400 ("The series
+    # does not exist."), so _request raises before any empty-seriess branch can
+    # run. Only that specific error degrades into the guidance the empty case
+    # already returns; any other failure keeps raising so the routing layer sees
+    # a vendor failure instead of silently dropping macro data.
+    try:
+        payload = _request("series", {"series_id": series_id, **realtime})
+    except ValueError as exc:
+        if not _is_unknown_series_error(exc):
+            raise
+        return _not_found_guidance(series_id)
+    meta = payload.get("seriess") or []
     if not meta:
-        return (
-            f"FRED series '{series_id}' not found. Pass a known alias "
-            f"(e.g. 'cpi', 'unemployment') or a valid FRED series ID."
-        )
+        return _not_found_guidance(series_id)
     info = meta[0]
     title = info.get("title", series_id)
     units = info.get("units_short") or info.get("units", "")
